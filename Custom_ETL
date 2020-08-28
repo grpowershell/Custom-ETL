@@ -1,0 +1,476 @@
+
+Function SFTPUpload
+{
+    # Function leverages Putty PSCP.exe to send a file over SFTP.
+    # Authentication mechanisms: User/Public/Private key-pair, User/Password
+    
+    param(
+        [Parameter(Mandatory=$False)]
+        [ValidateSet('Key','Password')]
+        [string]$AuthType,
+        [string]$SFTPUser,
+        [string]$Password,
+        [string]$SFTPHostname,
+        [string]$UploadDirectory,
+        [string]$PrivateKeyFile,
+        [int]$Port,
+        [string]$File,
+        [string]$Destination
+    )
+
+    $PSCPPath = "c:\program files (x86)\Company\Putty\PSCP.exe"
+    $SFTPUploadCommand = "$SFTPUser@$SFTPHostname" + ":$UploadDirectory"
+    $Batch = $File + " $SFTPUploadCommand"
+
+    $PSCPProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $PSCPProcessInfo.FileName = $PSCPPath
+    $PSCPProcessInfo.RedirectStandardError = $True
+    $PSCPProcessInfo.RedirectStandardOutput = $True
+    $PSCPProcessInfo.UseShellExecute = $False
+    $PSCPProcessInfo.CreateNoWindow = $True
+
+    Switch($AuthType)
+    {
+        "Key"
+        {
+            $PSCPProcessInfo.Arguments = "-i $PrivateKeyFile -v -P $Port $Batch"   
+        }
+
+        "Password"
+        {
+            $Arguments = "-pw" + ' "' + $Password + '" ' + "-v -P $Port $Batch"
+            $PSCPProcessInfo.Arguments = $Arguments
+        }
+    }  
+    
+    $PSCPProcess = New-Object System.Diagnostics.Process 
+    $PSCPProcess.StartInfo = $PSCPProcessInfo
+    $PSCPProcess.Start() | Out-Null
+    $stdout = $PSCPProcess.StandardOutput.ReadToEnd()
+    $stderr = $PSCPProcess.StandardError.ReadToEnd()
+    $PSCPProcess.WaitForExit()
+
+    $stdoutFileName = "d:\FF\$Destination\" + (Get-item $File).Name + "_upload_stdout.log"
+    $stderrFileName = "d:\FF\$Destination\" + (Get-item $File).Name + "_upload_stderr.log"
+    $stdout | Out-File -FilePath $stdoutFileName -Encoding utf8
+    $stderr | Out-File -FilePath $stderrFileName -Encoding utf8
+}
+
+Function Get-FFFiles
+{
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('System1','System2','System3')]
+        [string]$Destination,
+        [string]$DBServerFQDN,
+        [string]$Database
+    )
+
+    Switch($Destination)
+        {
+            "System1"
+            {
+                $filenamedate = get-date -Format "yyyyMMdd"
+                $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+                $sqlquery = "select * from view.vwDataFeedSystem1 for xml raw ('LE'), root ('LES'), elements xsinil"
+                $datafile = "d:\FF\System1\System1.$filenamedate.data.xml"
+
+                $con = new-object System.Data.SqlClient.SqlConnection
+                $con.connectionstring = $conString
+                $con.Open()
+
+                $cmd = $con.createcommand()
+                $cmd.CommandText = $sqlquery 
+                $cmd.CommandTimeout = 0
+
+                $rdr = $cmd.ExecuteXmlReader()
+                $w = new-object System.Xml.XmlTextWriter($datafile,[System.Text.Encoding]::UTF8)
+                $w.WriteNode($rdr,$true)
+                $w.Close()
+                $rdr.Close()
+
+                # Generate System1 Control file
+                new-item -name ".$filenamedate.S1.V1.control" -Path "d:\FF\System1\" -ItemType File | Out-Null
+
+                # Generate System1 Audit file content
+                $auditfiledate = (get-date -Format "yyyy-MM-dd").ToString()
+                $filesize = ((Get-ChildItem -File $datafile).Length).ToString()
+                $datafilename = "System1.$filenamedate.data.xml"
+                $LECount = ((Select-String -InputObject (Get-Content -Path $datafile) -Pattern "</LE>" -AllMatches).Matches.Count).ToString()
+
+                # Read System1 audit template file
+                $System1AuditTemplate = [xml](Get-Content -Path d:\FF\System1\Template\System1AuditFileTemplate.xml)
+
+                # Generate System1 Audit file
+                $System1AuditTemplate.AuditFile.Header.BusinessDate = $auditfiledate
+                $System1AuditTemplate.AuditFile.UnitOfWork.DataFile.FileName = $datafilename
+                $System1AuditTemplate.AuditFile.UnitOfWork.DataFile.FileSize = $filesize
+                $System1AuditTemplate.AuditFile.UnitOfWork.DataFile.RecordCount = $LegalEntityCount
+                $System1AuditTemplate.Save("d:\FF\System1\EGZAPX01.ApplicationName_KYC.AM.AA44622.US.$filenamedate.S1.V1.audit.xml")
+            }
+
+            "System2"
+            {
+                $filenamedate = get-date -Format "yyyyMMdd"
+                $datafile = "d:\FF\DataRefinery\ApplicationName_System2_$filenamedate.txt"
+
+                $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+                $sqlquery = "select * from Company.vwDataFeedSystem2"
+
+                $datatable = New-Object System.Data.DataTable
+
+                $con = new-object System.Data.SqlClient.SqlConnection
+                $con.connectionstring = $conString
+                $con.Open()
+
+                $cmd = New-Object System.Data.SqlClient.SqlCommand
+                $cmd.Connection = $con
+                $cmd.CommandText = $sqlquery
+                $reader = $cmd.ExecuteReader()
+                $datatable.Load($reader)
+                $con.Close()
+
+                # Generate data file
+
+                $Delimiter = ':'
+                $datatable | Export-csv -Path $datafile -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+                Set-Content $datafile ((Get-Content $datafile) -replace '"')
+                Set-Content $datafile ((Get-Content $datafile) -replace ':',"||")
+
+                # Generate control file
+
+                $ControlFileDate = (get-date -Format yyyy-MM-dd).ToString()
+                $datafileCreationDateTime = ((Get-ChildItem $datafile).CreationTime).ToString("yyyy-MM-dd hh:mm:ss")
+                $ControlFileTemplate = "d:\FF\System2\Template\ApplicationName_System2.template.cntl"
+                $NewControlFile = "d:\FF\System2\ApplicationName_System2_$filenamedate.cntl"
+                Copy-Item $ControlFileTemplate -Destination $NewControlFile
+                Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "DataFileName",(Get-Item -Path $datafile).Name)
+                Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "RecordCount",$datatable.Rows.Count)
+                Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "BusinessDate",$ControlFileDate)
+                Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "FileCreationDate",$datafileCreationDateTime)
+            }
+
+            "System3"
+            {
+                $filenamedate = get-date -Format "yyyyMMdd"
+                $datafile = "d:\FF\System3\ApplicationName_System3_$filenamedate.txt"
+
+                $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+                $sqlquery = "select * from Company.vwDataFeedSystem3"
+
+                $datatable = New-Object System.Data.DataTable
+
+                $con = new-object System.Data.SqlClient.SqlConnection
+                $con.connectionstring = $conString
+                $con.Open()
+
+                $cmd = New-Object System.Data.SqlClient.SqlCommand
+                $cmd.Connection = $con
+                $cmd.CommandText = $sqlquery
+                $reader = $cmd.ExecuteReader()
+                $datatable.Load($reader)
+                $con.Close()
+
+                # Generate data file
+
+                $Delimiter = ':'
+                #$datatable | Export-csv -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+                $datatable | ConvertTo-csv -Delimiter $Delimiter -NoTypeInformation | Select-Object -Skip 1 | Set-Content -path $datafile -Encoding UTF8
+                Set-Content $datafile ((Get-Content $datafile) -replace '"') -Encoding UTF8
+                Set-Content $datafile ((Get-Content $datafile) -replace ':',"ð") -Encoding UTF8
+                $RawString = Get-Content -Raw $datafile
+                $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllLines($datafile,$RawString,$UTF8NoBOMEncoding)
+
+                <#
+                # Convert file and encoding to 'ISO-8859-1'
+                $content = Get-Content $datafile
+                #$content | Out-File -FilePath $datafile -Encoding utf8
+                [System.IO.File]::WriteAllText($datafile,$content,[System.Text.Encoding]::GetEncoding('iso-8859-1'))
+                #>
+            }
+        }
+}
+
+Function Upload-FFFiles
+{
+    param(
+        [Parameter(Mandatory=$False)]
+        [ValidateSet('System1','System2','System3')]
+        [string]$Destination,
+        [string]$PrivateKeyFile,
+        [string]$Password,
+        [string]$SFTPUser,
+        [string]$SFTPHostname,
+        [string]$UploadDirectory,
+        [string]$Port,
+        [string]$MFTUser,
+        [string]$FType,
+        [string]$DBServerFQDN,
+        [string]$Database
+    )
+
+    Switch($Destination)
+    {
+        "System1" 
+        {    
+            # SFTP upload - User/Private Key authentication
+
+            $Date = Get-Date -Format yyyyMMdd
+
+            # Source file paths
+            $DataFilePath = "d:\FF\System1\EGZAPX01.ApplicationName_KYC.AM.AA44622.US.$Date.S1.V1.U1.D1.data.xml"
+            $AuditFilePath = "d:\FF\System1\EGZAPX01.ApplicationName_KYC.AM.AA44622.US.$Date.S1.V1.audit.xml"
+            $ControlFilePath = "d:\FF\System1\EGZAPX01.ApplicationName_KYC.AM.AA44622.US.$Date.S1.V1.control"
+
+            # Array of source file paths and log file names
+
+            $array = @(
+                @{File = $DataFilePath;Log = "Data"},
+                @{File = $AuditFilePath;Log = "Audit"},
+                @{File = $ControlFilePath;Log = "Control"}
+            ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+
+            Foreach ($item in $array)
+            {
+                $File = $item.File
+                SFTPUPload -Destination System1 -AuthType Key -SFTPUser $SFTPUser -SFTPHostname $SFTPHostname -UploadDirectory $UploadDirectory -PrivateKeyFile $PrivateKeyFile -Port $Port -File $File              
+            }
+
+            # Confirm upload
+            ## Data File
+            $DataFileUploadStdOutLog = "d:\FF\System1\" + (Get-Item -Path $DataFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $DataFileUpload = $True
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System1 Data file upload success"
+            } 
+            else 
+            {
+                $DataFileUpload = $False
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System1 Data file upload failure"
+            }
+
+            ## Audit File
+            $AuditFileUploadStdOutLog = "d:\FF\System1\" + (Get-Item -Path $AuditFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $AuditFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $AuditFileUpload = $True
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System1 Audit file upload success"
+            } 
+            else 
+            {
+                $AuditFileUpload = $False
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System1 Audit file upload failure"
+            }
+
+            ## Control File
+            $ControlFileUploadStdErrLog = "d:\FF\System1\" + (Get-Item -Path $ControlFilePath).Name + "_upload_stderr.log"
+            if ((Get-Content -Path $ControlFileUploadStdErrLog | Select-String "Session sent command exit status 0") -ne $Null)
+            {
+                $ControlFileUpload = $True
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System1 Control file upload success"
+            } 
+            else 
+            {
+                $ControlFileUpload = $False
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System1 Control file upload failure"
+            }
+
+            # If succsessful, write Offboard back to DB
+            
+            If (($DataFileUpload -and $AuditFileUpload -and $ControlFileUpload) -eq $True)
+            {
+                # Upload success, write Offboard back to DB
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System1 Data, Audit and Control files uploaded successfully"
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Writing offboarded status back to database"
+                
+                $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+                $con = new-object System.Data.SqlClient.SqlConnection
+                $con.connectionstring = $conString
+                
+                try
+                {
+                    $con.Open()
+                    $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                    Write-Host "$DateTime Connection to $DBServerFQDN successfully established."
+                    try
+                    {
+                        $cmd = New-Object System.Data.SqlClient.SqlCommand
+                        $cmd.Connection = $con
+                        $cmd.CommandText = "EXEC Company.DataFeedSystem1_Offboarded_MarkSent"
+                        $cmd.ExecuteNonQuery() | Out-Null
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Host "$DateTime Stored procedure Company.DataFeedSystem1_Offboarded_MarkSent executed successfully."
+                    }
+
+                    catch [Exception]
+                    {
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Warning $DateTime $_.Exception.Message
+                    }
+                }
+
+                catch [Exception]
+                {
+                    $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                    Write-Warning $DateTime $_.Exception.Message
+                }
+
+
+
+                finally
+                {
+                        $con.Dispose()
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Host "$DateTime SQL connection to $DBServerFQDN closed."
+                        $cmd.Dispose()
+                }        
+            }
+
+            else
+            {
+                # Upload failure, investigate - send email?
+                ## Send email with relevant logs from failed transfer?
+                $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                Write-host "$DateTime System1 datafile upload failure"
+            }
+
+            # Clean up output files and log files - move to d:\FF\System1\Archive\
+
+            Get-ChildItem -Path d:\FF\System1\ -Depth 0 -File | Move-Item -Destination d:\FF\System1\Archive\
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Host "$DateTime Cleaning up output directory. Moving output files and logs to ..."
+
+            # Remove archived files older than 30 days
+
+            $DaysBack = "-30"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem d:\FF\System1\Archive\ -Depth 0 -File | Where-Object {$_.LastWriteTime -lt $dateToDelete} | Remove-Item
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Host "$DateTime Cleaning up old output files and logs older than 30 days."
+        }
+
+        "System2" 
+        {
+            # SFTP Upload to TW - User/Password authentication
+
+            $Filenamedate = get-date -Format "yyyyMMdd"
+            
+
+            # Source file paths
+            $DatafilePath = "d:\FF\System2\ApplicationName_System2_$Filenamedate.txt"
+            $ControlFilePath = "d:\FF\System2\ApplicationName_System2_$Filenamedate.cntl"
+            
+            # Array of source file paths and log file names
+
+            $array = @(
+                @{File = $DataFilePath;Log = "Data"},
+                @{File = $ControlFilePath;Log = "Control"}
+            ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+            
+            Foreach ($item in $array)
+            {
+                $File = $item.File
+                SFTPUPload -Destination System2 -AuthType Password -SFTPUser $SFTPUser -Password $Password -SFTPHostname $SFTPHostname -UploadDirectory $UploadDirectory -Port $Port -File $File              
+            } 
+            
+            # Confirm upload
+            ## Data File
+            $DataFileUploadStdOutLog = "d:\FF\System2\" + (Get-Item -Path $DataFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $DataFileUpload = $True
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System2 Data file upload success"
+            } 
+            else 
+            {
+                $DataFileUpload = $False
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System2 Data file upload failure"
+            }
+
+            ## Control File
+            $ControlFileUploadStdOutLog = "d:\FF\System2\" + (Get-Item -Path $ControlFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $ControlFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $ControlFileUpload = $True
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System2 Control file upload success"
+            } 
+            else 
+            {
+                $ControlFileUpload = $False
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System2 Control file upload failure"
+            }
+
+            # Clean up output files and log files - move to d:\FF\System2\Archive\
+
+            Get-ChildItem -Path d:\FF\System2\ -Depth 0 -File | Move-Item -Destination d:\FF\System2\Archive\
+
+            # Remove archived files older than 30 days
+
+            $DaysBack = "-30"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem d:\FF\System2\Archive\ -Depth 0 -File | Where-Object {$_.LastWriteTime -lt $dateToDelete} | Remove-Item -Verbose
+        }
+
+        "System3" {
+
+            # MFT Upload
+
+            $Filenamedate = get-date -Format "yyyyMMdd"
+
+            # Source file paths
+            $DatafilePath = "d:\FF\System3\ApplicationName_System3_$Filenamedate.txt"
+            $MFTDataFileSyntax = "d:\\FF\System3\ApplicationName_System3_$Filenamedate.txt"
+
+            $MFTProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $MFTProcessInfo.FileName = "C:\Programs\Asi\bin\a0supply.exe"
+            $MFTProcessInfo.RedirectStandardError = $True
+            $MFTProcessInfo.RedirectStandardOutput = $True
+            $MFTProcessInfo.UseShellExecute = $False
+            $MFTProcessInfo.CreateNoWindow = $True
+            $MFTProcessInfo.Arguments = "user=$MFTUser ftype=$FType fname=$MFTDataFileSyntax"
+            $MFTProcess = New-Object System.Diagnostics.Process 
+            $MFTProcess.StartInfo = $MFTProcessInfo
+            $MFTProcess.Start() | Out-Null
+            $stdout = $MFTProcess.StandardOutput.ReadToEnd()
+            $stderr = $MFTProcess.StandardError.ReadToEnd()
+            $MFTProcess.WaitForExit()
+
+            $stdoutFileName = "d:\FF\System3\" + (Get-item $DataFilePath).Name + "_upload_stdout.log"
+            $stderrFileName = "d:\FF\System3\" + (Get-item $DataFilePath).Name + "_upload_stderr.log"
+            $stdout | Out-File -FilePath $stdoutFileName -Encoding utf8
+            $stderr | Out-File -FilePath $stderrFileName -Encoding utf8
+            
+            # Confirm upload
+            ## Data File
+            $DataFileUploadStdOutLog = "d:\FF\System3\" + (Get-Item -Path $DataFilePath).Name + "_upload_stdout.log"
+            $DataFileUploadStdErrLog = "d:\FF\System3\" + (Get-Item -Path $DataFilePath).Name + "_upload_stderr.log"
+            #if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "Transfer ID is <") -ne $Null)
+            if ((Get-Content -Path $DataFileUploadStdErrLog | Select-String "Transfer ID is <") -ne $Null)
+            {
+                $DataFileUpload = $True
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System3 Data file upload success"
+                Write-Host (Get-Content -Path $DataFileUploadStdErrLog | Select-String "Transfer ID is <")
+            } 
+            else 
+            {
+                $DataFileUpload = $False
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - System3 Data file upload failure"
+            }
+
+            # Clean up output files and log files - move to d:\FF\System3\Archive\
+
+            Get-ChildItem -Path d:\FF\System3\ -Depth 0 -File | Move-Item -Destination d:\FF\System3\Archive\
+
+            # Remove archived files older than 30 days
+
+            $DaysBack = "-30"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem d:\FF\System3\Archive\ -Depth 0 -File | Where-Object {$_.LastWriteTime -lt $dateToDelete} | Remove-Item -Verbose
+        }
+    }
+}
