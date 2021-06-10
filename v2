@@ -1,0 +1,1331 @@
+# FF UAT module
+
+Function SFTPUpload
+{
+    # Function leverages Putty PSCP.exe to send a file over SFTP.
+    # Authentication mechanisms: User/Public/Private key-pair, User/Password
+    
+    param(
+        [Parameter(Mandatory=$False)]
+        [ValidateSet('Key','Password')]
+        [string]$AuthType,
+        [string]$SFTPUser,
+        [string]$Password,
+        [string]$SFTPHostname,
+        [string]$UploadDirectory,
+        [string]$PrivateKeyFile,
+        [int]$Port,
+        [string]$File,
+        [string]$Destination
+    )
+
+    $PSCPPath = "c:\program files (x86)\Company\Putty\PSCP.exe"
+    $SFTPUploadCommand = "$SFTPUser@$SFTPHostname" + ":$UploadDirectory"
+    $Batch = $File + " $SFTPUploadCommand"
+
+    $PSCPProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $PSCPProcessInfo.FileName = $PSCPPath
+    $PSCPProcessInfo.RedirectStandardError = $True
+    $PSCPProcessInfo.RedirectStandardOutput = $True
+    $PSCPProcessInfo.UseShellExecute = $False
+    $PSCPProcessInfo.CreateNoWindow = $True
+
+    Switch($AuthType)
+    {
+        "Key"
+        {
+            $PSCPProcessInfo.Arguments = "-i $PrivateKeyFile -v -P $Port $Batch"   
+        }
+
+        "Password"
+        {
+            $Arguments = "-pw" + ' "' + $Password + '" ' + "-v -P $Port $Batch"
+            #$PSCPProcessInfo.Arguments = "-pw $Password -v -P $Port $Batch"
+            $PSCPProcessInfo.Arguments = $Arguments
+        }
+    }  
+    
+    $PSCPProcess = New-Object System.Diagnostics.Process 
+    $PSCPProcess.StartInfo = $PSCPProcessInfo
+    $PSCPProcess.Start() | Out-Null
+    $stdout = $PSCPProcess.StandardOutput.ReadToEnd()
+    $stderr = $PSCPProcess.StandardError.ReadToEnd()
+    $PSCPProcess.WaitForExit()
+
+    $stdoutFileName = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-item $File).Name + "_upload_stdout.log"
+    $stderrFileName = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-item $File).Name + "_upload_stderr.log"
+    $stdout | Out-File -FilePath $stdoutFileName -Encoding utf8
+    $stderr | Out-File -FilePath $stderrFileName -Encoding utf8
+}
+
+Function Get-ViewResults
+{
+    param(
+        [string]$DBServerFQDN,
+        [string]$Database,
+        [string]$ViewName
+    )
+
+    $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+    $sqlquery = "select * from $ViewName"
+    $datatable = New-Object System.Data.DataTable
+    $con = new-object System.Data.SqlClient.SqlConnection
+    $con.connectionstring = $conString
+    $con.Open()
+    $cmd = New-Object System.Data.SqlClient.SqlCommand
+    $cmd.Connection = $con
+    $cmd.CommandText = $sqlquery
+    $cmd.CommandTimeout = 900
+    $reader = $cmd.ExecuteReader()
+    $datatable.Load($reader)
+    $con.Close()
+    $GLOBAL:datatable = $datatable
+}
+
+Function Execute-SQLQuery
+{
+    param(
+        [string]$DBServerFQDN,
+        [string]$Database,
+        [string]$sqlquery
+    )
+
+    $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler]{
+    param($sender,$event) $GLOBAL:msg = $event.Message
+    Write-Host $GLOBAL:msg};
+    $connectionString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+    $connection = new-object System.Data.SqlClient.SqlConnection($connectionString)
+    $command = New-Object System.Data.SqlClient.SqlCommand
+    $command.Connection = $connection
+    $command.CommandText = $sqlquery
+    $command.Parameters.Add("@return_value", [System.Data.SqlDbType]"Int")
+    $command.Parameters["@return_value"].Direction = [System.Data.ParameterDirection]"ReturnValue"
+    $command.CommandTimeout = 300
+    
+    try
+    {
+        $connection.Open()
+        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+        Write-Host "$DateTime Connection to $DBServerFQDN successfully established."
+
+        try
+        {
+            $command.ExecuteNonQuery()
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Host "$DateTime Query executed successfully."
+        }
+
+        catch [Exception]
+        {
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Warning $DateTime $_.Exception.Message
+        }
+    }
+
+    catch [Exception]
+    {
+        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+        Write-Warning $DateTime $_.Exception.Message
+    }
+
+    finally
+    {
+        $connection.Dispose()
+        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+        Write-Host "$DateTime SQL connection to $DBServerFQDN closed."
+        [int]$GLOBAL:ReturnCode = $command.Parameters["@return_value"].Value
+        Write-Host "Returns $ReturnCode"
+        $command.Dispose()    
+    }
+}
+
+Function Execute-StoredProcedure
+{
+    param(
+        [string]$DBServerFQDN,
+        [string]$Database,
+        [string]$SPName,
+        [string]$SPVariables
+    )
+
+    if ($SPVariables -ne "")
+    {
+
+        [array]$SPVariables = $SPVariables.Split(",")
+        [int]$max = $SPVariables.Count
+        $SPVariablesArray = for ($i = 0; $i -lt $max; $i++)
+        {
+            Write-Verbose "$($SPVariables[$i])"
+            [PSCustomObject]@{
+                Variable = ($SPVariables[$i].Split("="))[0]
+                Value = ($SPVariables[$i].Split("="))[1]
+            }
+        }
+    }
+
+    $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler]{
+    param($sender,$event) $GLOBAL:msg = $event.Message
+    Write-Host $GLOBAL:msg};
+    $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+    $con = new-object System.Data.SqlClient.SqlConnection
+    $con.connectionstring = $conString
+    $con.add_InfoMessage($handler)
+    $con.FireInfoMessageEventOnUserErrors = $true
+             
+    try
+    {
+        $con.Open()
+        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+        Write-Host "$DateTime Connection to $DBServerFQDN successfully established."
+        try
+        {
+            $GLOBAL:cmd = New-Object System.Data.SqlClient.SqlCommand("$SPName")
+            $cmd.CommandType = [System.Data.CommandType]"StoredProcedure"
+            $cmd.Connection = $con
+            $cmd.Parameters.Add("@return_value", [System.Data.SqlDbType]"Int")
+            $cmd.Parameters["@return_value"].Direction = [System.Data.ParameterDirection]"ReturnValue"
+            if ($SPVariablesArray -ne "")
+            {
+                foreach ($item in $SPVariablesArray)
+                {
+                    $variable = "@" + $item.Variable
+                    $cmd.Parameters.AddWithValue("$variable",$item.Value)
+                }
+            }
+            <#
+            if ($SPVariables -ne $null)
+            {
+                $cmd.CommandText = "EXEC $SPName" + " $SPVariables"
+            }
+            else
+            {
+                $cmd.CommandText = "EXEC $SPName"
+            }
+            #>
+            $cmd.ExecuteNonQuery() #| Out-Null
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Host "$DateTime Stored procedure $SPName execution attempt. Check SQL server message to determine success/failure." # sort this out - move later
+        }
+
+        catch [Exception]
+        {
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Warning $DateTime $_.Exception.Message
+        }
+    }
+
+    catch [Exception]
+    {
+        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+        Write-Warning $DateTime $_.Exception.Message
+    }
+
+    finally
+    {
+        $con.Dispose()
+        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+        Write-Host "$DateTime SQL connection to $DBServerFQDN closed."
+        [int]$GLOBAL:ReturnCode = $cmd.Parameters["@return_value"].Value
+        Write-Host "Returns $ReturnCode"
+        $cmd.Dispose()
+    }          
+}
+
+Function Get-FFFiles
+{
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Dest1','Dest2','Dest3','Dest5','Dest4','Dest4AuM','Dest4AumHistorical')]
+        [string]$Destination,
+        [string]$DBServerFQDN,
+        [string]$Database,
+        [string]$Dest5ViewType
+    )
+
+    Switch($Destination)
+    {
+        "Dest1"
+        {
+            $filenamedate = get-date -Format "yyyyMMdd"
+            $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+            $sqlquery = "select * from Company.vwDataFeedDest1 for xml raw ('LEGALENTITY'), root ('LegalEntities'), elements xsinil"
+            $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\EGZAPX01.Application_KYC.AM.AA44622.US.$filenamedate.S1.V1.U1.D1.data.xml"
+
+            $con = new-object System.Data.SqlClient.SqlConnection
+            $con.connectionstring = $conString
+            $con.Open()
+
+            $cmd = $con.createcommand()
+            $cmd.CommandText = $sqlquery 
+            $cmd.CommandTimeout = 0
+
+            $rdr = $cmd.ExecuteXmlReader()
+            $w = new-object System.Xml.XmlTextWriter($datafile,[System.Text.Encoding]::UTF8)
+            $w.WriteNode($rdr,$true)
+            $w.Close()
+            $rdr.Close()
+
+            # Generate Dest1 Control file
+            new-item -name "EGZAPX01.Application_KYC.AM.AA44622.US.$filenamedate.S1.V1.control" -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" -ItemType File | Out-Null
+
+            # Generate Dest1 Audit file content
+            $auditfiledate = (get-date -Format "yyyy-MM-dd").ToString()
+            $filesize = ((Get-ChildItem -File $datafile).Length).ToString()
+            $datafilename = "EGZAPX01.Application_KYC.AM.AA44622.US.$filenamedate.S1.V1.U1.D1.data.xml"
+            $LegalEntityCount = ((Select-String -InputObject (Get-Content -Path $datafile) -Pattern "</LEGALENTITY>" -AllMatches).Matches.Count).ToString()
+
+            # Read Dest1 audit template file
+            $Dest1AuditTemplate = [xml](Get-Content -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Template\Dest1AuditFileTemplate.xml")
+
+            # Generate Dest1 Audit file
+            $Dest1AuditTemplate.AuditFile.Header.BusinessDate = $auditfiledate
+            $Dest1AuditTemplate.AuditFile.UnitOfWork.DataFile.FileName = $datafilename
+            $Dest1AuditTemplate.AuditFile.UnitOfWork.DataFile.FileSize = $filesize
+            $Dest1AuditTemplate.AuditFile.UnitOfWork.DataFile.RecordCount = $LegalEntityCount
+            $Dest1AuditTemplate.Save("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\EGZAPX01.Application_KYC.AM.AA44622.US.$filenamedate.S1.V1.audit.xml")
+        }
+
+        "Dest2"
+        {
+            $filenamedate = get-date -Format "yyyyMMdd"
+            $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Application_Dest2_$filenamedate.txt"
+
+            $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+            $sqlquery = "select * from Company.vwDataFeedDest2"
+
+            $datatable = New-Object System.Data.DataTable
+
+            $con = new-object System.Data.SqlClient.SqlConnection
+            $con.connectionstring = $conString
+            $con.Open()
+
+            $cmd = New-Object System.Data.SqlClient.SqlCommand
+            $cmd.Connection = $con
+            $cmd.CommandText = $sqlquery
+            $reader = $cmd.ExecuteReader()
+            $datatable.Load($reader)
+            $con.Close()
+
+            # Generate data file
+
+            $Delimiter = ':'
+            $datatable | Export-csv -Path $datafile -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+            Set-Content $datafile ((Get-Content $datafile) -replace '"')
+            Set-Content $datafile ((Get-Content $datafile) -replace ':',"||")
+
+            # Generate control file
+
+            $ControlFileDate = (get-date -Format yyyy-MM-dd).ToString()
+            $datafileCreationDateTime = ((Get-ChildItem $datafile).CreationTime).ToString("yyyy-MM-dd hh:mm:ss")
+            $ControlFileTemplate = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Template\Application_Dest2.template.cntl"
+            $NewControlFile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Application_Dest2_$filenamedate.cntl"
+            Copy-Item $ControlFileTemplate -Destination $NewControlFile
+            Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "DataFileName",(Get-Item -Path $datafile).Name)
+            Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "RecordCount",$datatable.Rows.Count)
+            Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "BusinessDate",$ControlFileDate)
+            Set-Content $NewControlFile ((Get-Content $NewControlFile) -replace "FileCreationDate",$datafileCreationDateTime)
+        }
+
+        "Dest3"
+        {
+            $filenamedate = get-date -Format "yyyyMMdd"
+            $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Application_Dest3_$filenamedate.txt"
+
+            $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+            $sqlquery = "select * from Company.vwDataFeedDest3"
+
+            $datatable = New-Object System.Data.DataTable
+
+            $con = new-object System.Data.SqlClient.SqlConnection
+            $con.connectionstring = $conString
+            $con.Open()
+
+            $cmd = New-Object System.Data.SqlClient.SqlCommand
+            $cmd.Connection = $con
+            $cmd.CommandText = $sqlquery
+            $reader = $cmd.ExecuteReader()
+            $datatable.Load($reader)
+            $con.Close()
+
+            # Generate data file
+
+            $Delimiter = ':'
+            #$datatable | Export-csv -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+            $datatable | ConvertTo-csv -Delimiter $Delimiter -NoTypeInformation | Select-Object -Skip 1 | Set-Content -path $datafile -Encoding UTF8
+            Set-Content $datafile ((Get-Content $datafile) -replace '"') -Encoding UTF8
+            Set-Content $datafile ((Get-Content $datafile) -replace ':',"ð") -Encoding UTF8
+            $RawString = Get-Content -Raw $datafile
+            $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllLines($datafile,$RawString,$UTF8NoBOMEncoding)
+        }
+
+        "Dest5"
+        {
+            Switch ($Dest5ViewType)
+            { 
+                "Full"
+                {
+                    $filenamedate = Get-Date -Format yyyyMMdd
+                    $Delimiter = '|'
+                
+                    # Declare Dest5 SQL Views
+
+                    $array = @(
+                    @{FileName = "Dest5_101_ENTITY_$filenamedate.csv";ViewName = "dbo.vwDest5LegalEntity"},
+                    @{FileName = "Dest5_102_Company_BUS_RELN_$filenamedate.csv";ViewName = "dbo.vwDest5CompanyBusRel"},
+                    @{FileName = "Dest5_103_ENTITY_XREF_$filenamedate.csv";ViewName = "dbo.vwDest5EntityXref"},
+                    @{FileName = "Dest5_104_OFFERING_ASSOC_$filenamedate.csv";ViewName = "dbo.vwDest5OfferingAssoc"},
+                    @{FileName = "Dest5_105_CONTRACT_$filenamedate.csv";ViewName = "dbo.vwDest5Contract"},
+                    @{FileName = "Dest5_106_CONTACT_$filenamedate.csv";ViewName = "dbo.vwDest5Contact"},
+                    @{FileName = "Dest5_107_Dest5E_$filenamedate.csv";ViewName = "dbo.vwDest5Dest5e"},
+                    @{FileName = "Dest5_108_PRODUCT_$filenamedate.csv";ViewName = "dbo.vwDest5Product"}
+                    ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+                
+                    foreach ($item in $array)
+                    {
+                        $ViewName = $item.ViewName
+                        $FileName = $item.FileName
+                        Get-ViewResults -DBServerFQDN $DBServerFQDN -Database $Database -ViewName $ViewName
+                        $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\$FileName"
+                        
+                        foreach ($column in $datatable.columns)
+                        {
+                            $column.ReadOnly = $False
+                        }
+
+                        foreach ($Row in $datatable)
+                        {
+                            $columns = $Row | Get-Member -MemberType Property
+                            foreach ($column in $columns)
+                            {
+                                $Row.($column.Name) = $Row.($column.Name) -replace '"','¬¬~'
+                            }
+                        }
+
+                        $datatableCSV = $datatable | ConvertTo-Csv -Delimiter $delimiter -NoTypeInformation #| foreach {$_ -replace '^"','¬{}¬' -replace '"$','¬{}¬'} 
+                        #$datatableCSV = $datatableCSV -replace '(?<!\|)"(?!\|)','~"'
+                        $datatableCSV = $datatableCSV | foreach {$_ -replace '¬¬~','~"'}
+                        $datatableCSV | Out-File -FilePath $datafile -Encoding UTF8
+                    }
+                }
+                    
+                "Delta"
+                {
+                    $filenamedate = Get-Date -Format yyyyMMdd
+                    $Delimiter = '|'
+                
+                    # Declare Dest5 SQL Views
+
+                    $array = @(
+                    @{FileName = "Dest5_101_ENTITY_$filenamedate.csv";ViewName = "dbo.vwDest5LegalEntityDelta"},
+                    @{FileName = "Dest5_102_Company_BUS_RELN_$filenamedate.csv";ViewName = "dbo.vwDest5CompanyBusRelDelta"},
+                    @{FileName = "Dest5_103_ENTITY_XREF_$filenamedate.csv";ViewName = "dbo.vwDest5EntityXrefDelta"},
+                    @{FileName = "Dest5_104_OFFERING_ASSOC_$filenamedate.csv";ViewName = "dbo.vwDest5OfferingAssocDelta"},
+                    @{FileName = "Dest5_105_CONTRACT_$filenamedate.csv";ViewName = "dbo.vwDest5ContractDelta"},
+                    @{FileName = "Dest5_106_CONTACT_$filenamedate.csv";ViewName = "dbo.vwDest5ContactDelta"},
+                    @{FileName = "Dest5_107_Dest5E_$filenamedate.csv";ViewName = "dbo.vwDest5Dest5eDelta"},
+                    @{FileName = "Dest5_108_PRODUCT_$filenamedate.csv";ViewName = "dbo.vwDest5ProductDelta"}
+                    ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+                
+                    foreach ($item in $array)
+                    {
+                        $ViewName = $item.ViewName
+                        $FileName = $item.FileName
+                        Get-ViewResults -DBServerFQDN $DBServerFQDN -Database $Database -ViewName $ViewName
+                        $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\$FileName"
+                        
+                        foreach ($column in $datatable.columns)
+                        {
+                            $column.ReadOnly = $False
+                        }
+
+                        foreach ($Row in $datatable)
+                        {
+                            $columns = $Row | Get-Member -MemberType Property
+                            foreach ($column in $columns)
+                            {
+                                $Row.($column.Name) = $Row.($column.Name) -replace '"','¬¬~'
+                            }
+                        }
+
+                        $datatableCSV = $datatable | ConvertTo-Csv -Delimiter $delimiter -NoTypeInformation #| foreach {$_ -replace '^"','¬{}¬' -replace '"$','¬{}¬'} 
+                        #$datatableCSV = $datatableCSV -replace '(?<!\|)"(?!\|)','~"'
+                        $datatableCSV = $datatableCSV | foreach {$_ -replace '¬¬~','~"'}
+                        $datatableCSV | Out-File -FilePath $datafile -Encoding UTF8
+                        
+                        if ($datatable.Rows.Count -eq 0)
+                        {
+                            $BlankFileName = $FileName.SCompanytring(0,$FileName.Length-12)
+                            Copy-Item "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Template\$BlankFileName" -Destination "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\$FileName" -Force
+                        } 
+                    }
+                }
+            }
+        }
+
+        "Dest4"
+        {   
+            # Set date for Dest4 files (last day of previous month)
+            # This is valid when run on any day in the month preceeding the desired month end date
+            
+            $currentdate = get-date -hour 0 -Minute 0 -Second 0
+            $monthago = $currentdate.AddMonths(-1)
+            $firstdayofmonth = get-date $monthago -day 1
+            $lastdayofmonth = get-date $firstdayofmonth.AddMonths(1).AddSeconds(-1) -Format yyyyMMdd
+            #$filenamedate = (get-date (get-date).AddDays(-1) -Format yyyyMMdd) # this should be last day of previous month always - not current method of -1 day
+            $filenamedate = $lastdayofmonth
+
+            $Delimiter = '|'
+                
+            # Declare Output filenames, Dest4 SQL Views, .OK file CLASS and filename dates
+
+            $array = @(
+            @{FileName = "ACCOUNT_AM_$filenamedate.psv";ViewName = "dbo.vwDest4Account";Class = "ACCOUNT";Date = $filenamedate},
+            @{FileName = "PARTY_AM_$filenamedate.psv";ViewName = "dbo.vwDest4Party";Class = "PARTY";Date = $filenamedate},
+            @{FileName = "PARTY_ACCOUNT_AM_$filenamedate.psv";ViewName = "dbo.vwDest4PartyAccount";Class = "PARTY_ACCOUNT";Date = $filenamedate}
+            ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+                
+            foreach ($item in $array)
+            {
+                $ViewName = $item.ViewName
+                $FileName = $item.FileName
+                $Date = $item.Date
+                # Generate .psv file
+                Get-ViewResults -DBServerFQDN $DBServerFQDN -Database $Database -ViewName $ViewName
+                $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName"
+                $datatable | Export-csv -Path $datafile -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+                # Remove empty lines at end of file (CRLF character designating carriage return)
+                $input = [IO.File]::ReadAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName")
+                [IO.FILE]::WriteAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName", $input.TrimEnd())
+                
+                #  Convert UTF8 output .psv file to UTF8 without BOM
+                ## Read content from UTF8 with BOM output .psv file and overwrites file with UTF8 file without BOM
+                $RawString = Get-Content -Raw $datafile
+                $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllLines($datafile,$RawString,$UTF8NoBOMEncoding)
+
+                # Generate .OK file
+                $OKFileName = $FileName + ".OK"
+                $datafileCHECKSUM = ((Get-FileHash -Path $datafile -Algorithm MD5).Hash).ToLower()
+                $OKFileContent = Get-Content -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Template\Dest4_OK_File.template"
+                $OKFileContent = $OKFileContent -replace "YYYYMMDD",$Date -replace "CLASS",$item.Class -replace "FILE_NAME",$FileName -replace "RECORD_COUNT",$datatable.Rows.Count -replace "CHECKSUM",$datafileCHECKSUM
+                $OKFileContent | Out-File "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName" -Encoding utf8
+                # Remove empty lines at end of file (CRLF character designating carriage return)
+                $input = [IO.File]::ReadAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName")
+                [IO.FILE]::WriteAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName", $input.TrimEnd())
+                
+                #  Convert UTF8 output .psv.ok file to UTF8 without BOM
+                ## Reads content from UTF8 with BOM output .psv.ok file and overwrites file with UTF8 file without BOM
+                $OKDatafileName = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName"
+                $RawString = Get-Content -Raw $OKDatafileName
+                $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllLines($OKDatafileName,$RawString,$UTF8NoBOMEncoding)
+
+                #$datatableCSV = $datatable | ConvertTo-Csv -Delimiter $delimiter -NoTypeInformation | foreach {$_ -replace '^"','¬{}¬' -replace '"$','¬{}¬'} 
+                #$datatableCSV = $datatableCSV -replace '(?<!\|)"(?!\|)','~"'
+                #$datatableCSV = $datatableCSV | foreach {$_ -replace '¬{}¬','"'}
+                #$datatableCSV | Out-File -FilePath $datafile -Encoding UTF8
+            }
+        }
+
+        "Dest4AuM"
+        {
+            # Create temporary table dbo.ControlDBTemp for ingestion of data from:
+            # \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\ControlDB-Refresh\controlDB.csv
+
+            # Declare CREATE query
+            $sqlquery =
+            "CREATE TABLE dbo.ControlDBTemp
+            (
+            [global_product_id] [nvarchar](100) NOT  NULL,
+            [global_share_class_id] [nvarchar](100)  NULL,
+            [fast_id] [nvarchar](100) NULL,
+            [client_legal_name] [nvarchar](1024) NULL
+            )" -replace "(?m)^\s+"
+            
+            # Create ControlDB temporary table dbo.ControlDBTemp
+
+            Write-Host "Creating temporary table dbo.ControlDBTemp"
+            Execute-SQLQuery -DBServerFQDN $DBServerFQDN -Database $Database -sqlquery $sqlquery
+            if ($ReturnCode -ne 0)
+            {
+                Write-Host "Return code non-zero, exiting due to error."
+                #Write-Host "Error message: $GLOBAL:msg"
+                Start-Sleep -Seconds 30
+                Exit $LASTEXITCODE
+            }
+            
+            # Import controlDB file in to array
+
+            Write-Host "Importing \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\ControlDB-Refresh\controlDB.csv"
+            $ControlDBImport = Import-Csv -Delimiter '|' -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\ControlDB-Refresh\controlDB.csv"
+
+            # For each row in $ControlDBImport insert row in to temporary table dbo.ControlDBTemp
+
+            $i = 0
+            ForEach ($item in $ControlDBImport)
+            {
+                $GlobalProductID = "'" + $item.Global_Product_ID + "'"
+                if ($item.GLOBAL_SHARE_CLASS_ID -eq ""){$GlobalShareClassID = "NULL"} else {$GlobalShareClassID = "'" + $item.Global_Share_Class_ID + "'"}
+                if ($item.FAST_ID -eq ""){$FastID = "NULL"} else {$FastID = "'" + $item.FAST_ID + "'"}
+                if ($item.CLIENT_LEGAL_NAME -eq ""){$ClientLegalName = "NULL"} else {$ClientLegalName = "'" + ($item.CLIENT_LEGAL_NAME -replace "'","''") + "'"}
+                
+                # Declare INSERT query
+                $sqlquery = 
+                "INSERT INTO dbo.ControlDBTemp
+                (
+                [global_product_id],
+                [global_share_class_id],
+                [fast_id],
+                [client_legal_name]
+                )
+                VALUES
+                (
+                $GlobalProductID,
+                $GlobalShareClassID,
+                $FastID,
+                $ClientLegalName
+                )" -replace "(?m)^\s+"
+
+                # Insert row in to dbo.ControlDBTemp
+
+                $i =$i + 1
+                Execute-SQLQuery -DBServerFQDN $DBServerFQDN -Database $Database -sqlquery $sqlquery
+                if ($ReturnCode -ne 0)
+                {
+                    Write-Host "Return code non-zero, exiting due to error."
+                    #Write-Host "Error message: $GLOBAL:msg"
+                    Write-host "Exited at line number $i"
+                    Start-Sleep -Seconds 30
+                    Exit $LASTEXITCODE
+                }
+            }
+
+            Write-Host "$i lines successfully inserted."
+
+            # Create temporary table dbo.AuM_BulkInsert_Temp for ingestion of data from:
+            # \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuM-Ingest\<MMMYYYY_YYYYMMDD>.csv
+
+            # Declare CREATE query
+            $sqlquery =
+            "CREATE TABLE dbo.AuM_BulkInsert_Temp
+            (
+            [TechnicalAccountID] [nvarchar](100) NULL,
+            [FundID] [nvarchar](100) NOT NULL,
+            [FundName] [nvarchar](1024) NULL,
+            [AuM] [nvarchar](100) NULL,
+            [AuMInBillion] [nvarchar](30) NULL
+            )" -replace "(?m)^\s+"
+
+            # Create AuM temporary table dbo.AuM_BulkInsert_Temp
+
+            Write-Host "Creating temporary table dbo.AuM_BulkInsert_Temp"
+            Execute-SQLQuery -DBServerFQDN $DBServerFQDN -Database $Database -sqlquery $sqlquery
+            if ($ReturnCode -ne 0)
+            {
+                Write-Host "Return code non-zero, exiting due to error."
+                #Write-Host "Error message: $GLOBAL:msg"
+                Start-Sleep -Seconds 30
+                Exit $LASTEXITCODE
+            }
+
+            # Import AuM ingest file in to array
+
+            $AuMIngestFileName = (Get-ChildItem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuM-Ingest\" -File -Depth 0).Name
+            Write-Host "Importing \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuM-Ingest\$AuMIngestFileName"
+            [array]$AuMImport = Import-Csv -Delimiter '|' -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuM-Ingest\$AuMIngestFileName"
+
+            # For each row in $AuMImport insert row in to temporary table dbo.AuM_BulkInsert_Temp
+
+            $i = 0
+            ForEach ($item in $AuMImport)
+            {
+                # Declare INSERT query
+                
+                if ($item.TechnicalAccountID -eq ""){$TechnicalAccountID = "NULL"} else {$TechnicalAccountID = "'" + $item.TechnicalAccountID + "'"}
+                $FundID = "'" + $item.FundID + "'"
+                if ($item.FundName -eq ""){$FundName = "NULL"} else {$FundName = "'" + ($item.FundName -replace "'","''") + "'"}
+                if ($item.AuM -eq ""){$AuM = "NULL"} else {$AuM = "'" + $item.AuM + "'"}
+                if ($item.AuMInBillion -eq ""){$AuMInBillion = "NULL"} else {$AuMInBillion = "'" + $item.AuMInBillion + "'"}
+                
+                $sqlquery = 
+                "INSERT INTO dbo.AuM_BulkInsert_Temp
+                (
+                [TechnicalAccountID],
+                [FundID],
+                [FundName],
+                [AuM],
+                [AuMInBillion]
+                )
+                VALUES
+                (
+                $TechnicalAccountID,
+                $FundID,
+                $FundName,
+                $AuM,
+                $AuMInBillion
+                )" -replace "(?m)^\s+"
+                
+                # Insert row in to dbo.ControlDBTemp
+                $i =$i + 1
+                Execute-SQLQuery -DBServerFQDN $DBServerFQDN -Database $Database -sqlquery $sqlquery
+                if ($ReturnCode -ne 0)
+                {
+                    Write-Host "Return code non-zero, exiting due to error."
+                    #Write-Host "Error message: $GLOBAL:msg"
+                    Write-host "Exited at line number $i"
+                    Start-Sleep -Seconds 30
+                    Exit $LASTEXITCODE
+                }
+            }
+
+            Write-Host "$i lines successfully inserted."
+
+            # Execute stored procedures 1-4
+            
+            # 1. Execute dbo.RefreshControlDB
+
+            $SPName = "dbo.RefreshControlDB"
+
+            #$SPVariables = "FilePath=\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\ControlDB-Refresh\controlDB.csv"
+
+            Execute-StoredProcedure -DBServerFQDN $DBServerFQDN -Database $Database -SPName $SPName #-SPVariables $SPVariables
+            if ($ReturnCode -ne 0)
+            {
+                Write-Host "Return code non-zero, exiting due to error."
+                #Write-Host "Error message: $GLOBAL:msg"
+                Start-Sleep -Seconds 30
+                Exit $LASTEXITCODE
+            }
+
+            # 2. Execute dbo.InsertMonthlyAUM - variables: AddMonth
+
+            $SPName = "dbo.InsertMonthlyAUM"
+            $AddMonth = (Get-ChildItem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuM-Ingest\" -File -Depth 0).BaseName
+            [array]$AddMonth = $AddMonth.Split("_")
+            $SPVariables = "AddMonth=" + $AddMonth[0]
+
+            Execute-StoredProcedure -DBServerFQDN $DBServerFQDN -Database $Database -SPName $SPName -SPVariables $SPVariables
+            if ($ReturnCode -ne 0)
+            {
+                Write-Host "Return code non-zero, exiting due to error."
+                #Write-Host "Error message: $GLOBAL:msg"
+                Start-Sleep -Seconds 30
+                Exit $LASTEXITCODE
+            }
+
+            # 3. Execute dbo.MonthlyAuMViewUpdate - CREATE/ALTER view
+
+            $SPName = "dbo.MonthlyAuMViewUpdate"
+
+            Execute-StoredProcedure -DBServerFQDN $DBServerFQDN -Database $Database -SPName $SPName
+            if ($ReturnCode -ne 0)
+            {
+                Write-Host "Return code non-zero, exiting due to error."
+                Start-Sleep -Seconds 30
+                Exit $LASTEXITCODE
+            }
+
+            # 4. Execute dbo.Dest4MonthlyAccountBalanceViewUpdate
+
+            $SPName = "dbo.Dest4MonthlyAccountBalanceViewUpdate"
+            $SPVariables = "AuMDate=" + $AddMonth[1]
+
+            Execute-StoredProcedure -DBServerFQDN $DBServerFQDN -Database $Database -SPName $SPName -SPVariables $SPVariables
+            if ($ReturnCode -ne 0)
+            {
+                Write-Host "Return code non-zero, exiting due to error."
+                Start-Sleep -Seconds 30
+                Exit $LASTEXITCODE
+            }
+
+            # 5. create file MONTHLY_ACCOUNT_BALANCE_AM_<date>.psv off view dbo.vwDest4MonthlyAccountBalance
+
+            $AuMfilenamedate = $AddMonth[1]
+
+            $Delimiter = '|'
+                
+            # Declare Output filenames, Dest4 SQL Views, .OK file CLASS and filename dates
+
+            $array = @(
+            @{FileName = "MONTHLY_ACCOUNT_BALANCE_AM_$AuMfilenamedate.psv";ViewName = "dbo.vwDest4MonthlyAccountBalance";Class = "ACCOUNT";Date = $AuMfilenamedate}
+            ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+                
+            foreach ($item in $array)
+            {
+                $ViewName = $item.ViewName
+                $FileName = $item.FileName
+                $Date = $item.Date
+                # Generate .psv file
+                Get-ViewResults -DBServerFQDN $DBServerFQDN -Database $Database -ViewName $ViewName
+                $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName"
+                $datatable | Export-csv -Path $datafile -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+                # Remove empty lines at end of file (CRLF character designating carriage return)
+                $input = [IO.File]::ReadAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName")
+                [IO.FILE]::WriteAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName", $input.TrimEnd())
+                
+                #  Convert UTF8 output .psv file to UTF8 without BOM
+                ## Read content from UTF8 with BOM output .psv file and overwrites file with UTF8 file without BOM
+                $RawString = Get-Content -Raw $datafile
+                $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllLines($datafile,$RawString,$UTF8NoBOMEncoding)
+                
+                # Generate .OK file
+                $OKFileName = $FileName + ".OK"
+                $datafileCHECKSUM = ((Get-FileHash -Path $datafile -Algorithm MD5).Hash).ToLower()
+                $OKFileContent = Get-Content -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\Template\Dest4_OK_File.template"
+                $OKFileContent = $OKFileContent -replace "YYYYMMDD",$Date -replace "CLASS",$item.Class -replace "FILE_NAME",$FileName -replace "RECORD_COUNT",$datatable.Rows.Count -replace "CHECKSUM",$datafileCHECKSUM
+                $OKFileContent | Out-File "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName" -Encoding utf8
+                # Remove empty lines at end of file (CRLF character designating carriage return)
+                $input = [IO.File]::ReadAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName")
+                [IO.FILE]::WriteAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName", $input.TrimEnd())
+                
+                #  Convert UTF8 output .psv.ok file to UTF8 without BOM
+                ## Reads content from UTF8 with BOM output .psv.ok file and overwrites file with UTF8 file without BOM
+                $OKDatafileName = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName"
+                $RawString = Get-Content -Raw $OKDatafileName
+                $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+                [System.IO.File]::WriteAllLines($OKDatafileName,$RawString,$UTF8NoBOMEncoding)
+
+                #$datatableCSV = $datatable | ConvertTo-Csv -Delimiter $delimiter -NoTypeInformation | foreach {$_ -replace '^"','¬{}¬' -replace '"$','¬{}¬'} 
+                #$datatableCSV = $datatableCSV -replace '(?<!\|)"(?!\|)','~"'
+                #$datatableCSV = $datatableCSV | foreach {$_ -replace '¬{}¬','"'}
+                #$datatableCSV | Out-File -FilePath $datafile -Encoding UTF8
+            }
+        }
+
+        "Dest4AuMHistorical"
+        {
+            # 1. Ingest AuMHistorical.txt variable file
+            # Each line up until last line is AumDate. File can contain one or more AumDate entries. Last line is ClientFilterDate. 
+            # File located at: \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuMHistorical\AumHistorical.txt
+            
+            # Import content from \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuMHistorical\AumHistorical.txt to variable $AumHistoricalTXTContent
+            $AumHistoricalTXTContent = Get-Content -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\AuMHistorical\AumHistorical.txt"
+            
+            # Set $ClientFilterDate to last line of array $AumHistoricalTXTContent
+            $ClientFilterDate = $AumHistoricalTXTContent[$AumHistoricalTXTContent.count -1]
+
+            # Trim array end/bottom of array $AumHistoricalTXTContent by 1 to remove ClientFilterDate as it would be processsed as additional AumDate in loop below.
+            $AumHistoricalTXTContent = $AumHistoricalTXTContent[0..($AumHistoricalTXTContent.Length-2)]
+
+            Foreach ($AumDate in $AumHistoricalTXTContent)
+            {
+                #$AumDate = $AumHistoricalTXTContent[0]
+                #the bottom/last date
+             
+                # 2. Execute stored procedure dbo.Dest4MonthlyAccountBalanceViewUpdateHistorical on database Application_KYC_AM_MISDW_UAT
+                # Stored procedure dbo.Dest4MonthlyAccountBalanceViewUpdateHistorical. Variables: 'AumDate','ClientFilterDate'
+
+                $SPName = "dbo.Dest4MonthlyAccountBalanceViewUpdateHistorical"
+                $SPVariables = "AuMDate=" + $AumDate + "," + "ClientFilterDate=" + $ClientFilterDate
+
+                Execute-StoredProcedure -DBServerFQDN $DBServerFQDN -Database $Database -SPName $SPName -SPVariables $SPVariables
+                if ($ReturnCode -ne 0)
+                {
+                    Write-Host "Return code non-zero, exiting due to error."
+                    #Write-Host "Error message: $GLOBAL:msg"
+                    Start-Sleep -Seconds 30
+                    Exit $LASTEXITCODE
+                }
+
+                # 3. Create file MONTHLY_ACCOUNT_BALANCE_AM_<date>.psv off view dbo.vwDest4MonthlyAccountBalanceHistorical
+        
+                $AuMfilenamedate = $AumDate
+
+                $Delimiter = '|'
+                
+                # Declare Output filenames, SQL Views, .OK file CLASS and filename dates
+
+                $array = @(
+                @{FileName = "MONTHLY_ACCOUNT_BALANCE_AM_$AumDate.psv";ViewName = "dbo.vwDest4MonthlyAccountBalanceHistorical";Class = "ACCOUNT";Date = $AumDate}
+                ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+                
+                foreach ($item in $array)
+                {
+                    $ViewName = $item.ViewName
+                    $FileName = $item.FileName
+                    $Date = $item.Date
+                    # Generate .psv file
+                    Get-ViewResults -DBServerFQDN $DBServerFQDN -Database $Database -ViewName $ViewName
+                    $datafile = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName"
+                    $datatable | Export-csv -Path $datafile -Delimiter $Delimiter -NoTypeInformation -Encoding UTF8
+                    # Remove empty lines at end of file (CRLF character designating carriage return)
+                    $input = [IO.File]::ReadAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName")
+                    [IO.FILE]::WriteAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$FileName", $input.TrimEnd())
+                    
+                    #  Convert UTF8 output .psv file to UTF8 without BOM
+                    ## Read content from UTF8 with BOM output .psv file and overwrites file with UTF8 file without BOM
+                    $RawString = Get-Content -Raw $datafile
+                    $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+                    [System.IO.File]::WriteAllLines($datafile,$RawString,$UTF8NoBOMEncoding)
+
+                    # Generate .OK file
+                    $OKFileName = $FileName + ".OK"
+                    $datafileCHECKSUM = ((Get-FileHash -Path $datafile -Algorithm MD5).Hash).ToLower()
+                    $OKFileContent = Get-Content -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\Template\Dest4_OK_File.template"
+                    $OKFileContent = $OKFileContent -replace "YYYYMMDD",$Date -replace "CLASS",$item.Class -replace "FILE_NAME",$FileName -replace "RECORD_COUNT",$datatable.Rows.Count -replace "CHECKSUM",$datafileCHECKSUM
+                    $OKFileContent | Out-File "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName" -Encoding utf8
+                    # Remove empty lines at end of file (CRLF character designating carriage return)
+                    $input = [IO.File]::ReadAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName")
+                    [IO.FILE]::WriteAllText("\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName", $input.TrimEnd())
+                    
+                    #  Convert UTF8 output .psv.ok file to UTF8 without BOM
+                    ## Reads content from UTF8 with BOM output .psv.ok file and overwrites file with UTF8 file without BOM
+                    $OKDatafileName = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\$OKFileName"
+                    $RawString = Get-Content -Raw $OKDatafileName
+                    $UTF8NoBOMEncoding = New-Object System.Text.UTF8Encoding $false
+                    [System.IO.File]::WriteAllLines($OKDatafileName,$RawString,$UTF8NoBOMEncoding)
+
+                    #$datatableCSV = $datatable | ConvertTo-Csv -Delimiter $delimiter -NoTypeInformation | foreach {$_ -replace '^"','¬{}¬' -replace '"$','¬{}¬'} 
+                    #$datatableCSV = $datatableCSV -replace '(?<!\|)"(?!\|)','~"'
+                    #$datatableCSV = $datatableCSV | foreach {$_ -replace '¬{}¬','"'}
+                    #$datatableCSV | Out-File -FilePath $datafile -Encoding UTF8
+                }
+            }
+        }
+    }
+}
+
+Function Upload-FFFiles
+{
+    param(
+        [Parameter(Mandatory=$False)]
+        [ValidateSet('Dest1','Dest2','Dest3','Dest5','Dest4','Dest4AuM','Dest4AumHistorical')]
+        [string]$Destination,
+        [string]$PrivateKeyFile,
+        [string]$Password,
+        [string]$SFTPUser,
+        [string]$SFTPHostname,
+        [string]$UploadDirectory,
+        [string]$Port,
+        [string]$MFTUser,
+        [string]$FType,
+        [string]$DBServerFQDN,
+        [string]$Database
+    )
+
+    Switch($Destination)
+    {
+        "Dest1" 
+        {    
+            # SFTP upload - User/Private Key authentication
+
+            $Date = Get-Date -Format yyyyMMdd
+
+            # Source file paths
+            $DataFilePath = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\EGZAPX01.Application_KYC.AM.AA44622.US.$Date.S1.V1.U1.D1.data.xml"
+            $AuditFilePath = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\EGZAPX01.Application_KYC.AM.AA44622.US.$Date.S1.V1.audit.xml"
+            $ControlFilePath = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\EGZAPX01.Application_KYC.AM.AA44622.US.$Date.S1.V1.control"
+
+            # Array of source file paths and log file names
+
+            $array = @(
+                @{File = $DataFilePath;Log = "Data"},
+                @{File = $AuditFilePath;Log = "Audit"},
+                @{File = $ControlFilePath;Log = "Control"}
+            ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+
+            Foreach ($item in $array)
+            {
+                $File = $item.File
+                SFTPUPload -Destination Dest1 -AuthType Key -SFTPUser $SFTPUser -SFTPHostname $SFTPHostname -UploadDirectory $UploadDirectory -PrivateKeyFile $PrivateKeyFile -Port $Port -File $File              
+            }
+
+            # Confirm upload
+            ## Data File
+            $DataFileUploadStdOutLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-Item -Path $DataFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $DataFileUpload = $True
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest1 Data file upload success"
+            } 
+            else 
+            {
+                $DataFileUpload = $False
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest1 Data file upload failure"
+            }
+
+            ## Audit File
+            $AuditFileUploadStdOutLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-Item -Path $AuditFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $AuditFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $AuditFileUpload = $True
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest1 Audit file upload success"
+            } 
+            else 
+            {
+                $AuditFileUpload = $False
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest1 Audit file upload failure"
+            }
+
+            ## Control File
+            $ControlFileUploadStdErrLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-Item -Path $ControlFilePath).Name + "_upload_stderr.log"
+            if ((Get-Content -Path $ControlFileUploadStdErrLog | Select-String "Session sent command exit status 0") -ne $Null)
+            {
+                $ControlFileUpload = $True
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest1 Control file upload success"
+            } 
+            else 
+            {
+                $ControlFileUpload = $False
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest1 Control file upload failure"
+            }
+
+            # If succsessful, write Offboard back to DB
+            
+            If (($DataFileUpload -and $AuditFileUpload -and $ControlFileUpload) -eq $True)
+            {
+                # Upload success, write Offboard back to DB
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest1 Data, Audit and Control files uploaded successfully"
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Writing offboarded status back to database"
+                
+                $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+                $con = new-object System.Data.SqlClient.SqlConnection
+                $con.connectionstring = $conString
+                
+                try
+                {
+                    $con.Open()
+                    $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                    Write-Host "$DateTime Connection to $DBServerFQDN successfully established."
+                    try
+                    {
+                        $cmd = New-Object System.Data.SqlClient.SqlCommand
+                        $cmd.Connection = $con
+                        $cmd.CommandText = "EXEC Company.DataFeedDest1_Offboarded_MarkSent"
+                        $cmd.ExecuteNonQuery() | Out-Null
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Host "$DateTime Stored procedure Company.DataFeedDest1_Offboarded_MarkSent executed successfully."
+                    }
+
+                    catch [Exception]
+                    {
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Warning $DateTime $_.Exception.Message
+                    }
+                }
+
+                catch [Exception]
+                {
+                    $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                    Write-Warning $DateTime $_.Exception.Message
+                }
+
+                finally
+                {
+                        $con.Dispose()
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Host "$DateTime SQL connection to $DBServerFQDN closed."
+                        $cmd.Dispose()
+                }        
+            }
+
+            else
+            {
+                # Upload failure, investigate - send email?
+                ## Send email with relevant logs from failed transfer?
+                $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                Write-host "$DateTime Dest1 datafile upload failure"
+            }
+
+            # Clean up output files and log files - move to d:\FF\Dest1\Archive\
+
+            Get-ChildItem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" -Depth 0 -File | Move-Item -Destination "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\"
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Host "$DateTime Cleaning up output directory. Moving output files and logs to ..."
+
+            # Remove archived files older than 60 days
+
+            $DaysBack = "-60"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\" -Depth 0 -File | Where-Object {$_.LastWriteTime -lt $dateToDelete} | Remove-Item
+            $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+            Write-Host "$DateTime Cleaning up old output files and logs older than 60 days."
+        }
+
+        "Dest2" 
+        {
+            # SFTP Upload to Tumbleweed - User/Password authentication
+
+            $Filenamedate = get-date -Format "yyyyMMdd"
+            
+            # Source file paths
+            $DatafilePath = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Application_Dest2_$Filenamedate.txt"
+            $ControlFilePath = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Application_Dest2_$Filenamedate.cntl"
+            
+            # Array of source file paths and log file names
+
+            $array = @(
+                @{File = $DataFilePath;Log = "Data"},
+                @{File = $ControlFilePath;Log = "Control"}
+            ) | % {New-Object object | Add-Member -NotePropertyMembers $_ -PassThru}
+            
+            Foreach ($item in $array)
+            {
+                $File = $item.File
+                SFTPUPload -Destination Dest2 -AuthType Password -SFTPUser $SFTPUser -Password $Password -SFTPHostname $SFTPHostname -UploadDirectory $UploadDirectory -Port $Port -File $File              
+            } 
+            
+            # Confirm upload
+            ## Data File
+            $DataFileUploadStdOutLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-Item -Path $DataFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $DataFileUpload = $True
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest2 Data file upload success"
+            } 
+            else 
+            {
+                $DataFileUpload = $False
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest2 Data file upload failure"
+            }
+
+            ## Control File
+            $ControlFileUploadStdOutLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-Item -Path $ControlFilePath).Name + "_upload_stdout.log"
+            if ((Get-Content -Path $ControlFileUploadStdOutLog | Select-String "100%") -ne $Null)
+            {
+                $ControlFileUpload = $True
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest2 Control file upload success"
+            } 
+            else 
+            {
+                $ControlFileUpload = $False
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest2 Control file upload failure"
+            }
+
+            # Clean up output files and log files - move to \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\
+
+            Get-ChildItem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" -Depth 0 -File | Move-Item -Destination "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\"
+
+            # Remove archived files older than 60 days
+
+            $DaysBack = "-60"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\" -Depth 0 -File | Where-Object {$_.LastWriteTime -lt $dateToDelete} | Remove-Item -Verbose
+        }
+
+        "Dest3"
+        {
+            # MFT Upload
+
+            $Filenamedate = get-date -Format "yyyyMMdd"
+
+            # Source file paths 
+            $DatafilePath = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Application_Dest3_$Filenamedate.txt"
+
+            # Copy file to local server to D:\FF\Dest3
+
+            Copy-Item -Path $DataFilePath -Destination "D:\FF\Dest3\" -Force | Out-Null
+
+            $MFTDataFileSyntax = "D:\\FF\Dest3\Application_Dest3_$Filenamedate.txt"
+
+            $MFTProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $MFTProcessInfo.FileName = "C:\Programs\Asi\bin\a0supply.exe"
+            $MFTProcessInfo.RedirectStandardError = $True
+            $MFTProcessInfo.RedirectStandardOutput = $True
+            $MFTProcessInfo.UseShellExecute = $False
+            $MFTProcessInfo.CreateNoWindow = $True
+            $MFTProcessInfo.Arguments = "user=$MFTUser ftype=$FType fname=$MFTDataFileSyntax"
+            $MFTProcess = New-Object System.Diagnostics.Process 
+            $MFTProcess.StartInfo = $MFTProcessInfo
+            $MFTProcess.Start() | Out-Null
+            $stdout = $MFTProcess.StandardOutput.ReadToEnd()
+            $stderr = $MFTProcess.StandardError.ReadToEnd()
+            $MFTProcess.WaitForExit()
+
+            $stdoutFileName = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-item $DataFilePath).Name + "_upload_stdout.log"
+            $stderrFileName = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-item $DataFilePath).Name + "_upload_stderr.log"
+            $stdout | Out-File -FilePath $stdoutFileName -Encoding utf8
+            $stderr | Out-File -FilePath $stderrFileName -Encoding utf8
+            
+            # Confirm upload
+            ## Data File
+            $DataFileUploadStdOutLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-Item -Path $DataFilePath).Name + "_upload_stdout.log"
+            $DataFileUploadStdErrLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + (Get-Item -Path $DataFilePath).Name + "_upload_stderr.log"
+            #if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "Transfer ID is <") -ne $Null)
+            if ((Get-Content -Path $DataFileUploadStdErrLog | Select-String "Transfer ID is <") -ne $Null)
+            {
+                $DataFileUpload = $True
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest3 Data file upload success"
+                Write-Host (Get-Content -Path $DataFileUploadStdErrLog | Select-String "Transfer ID is <")
+            } 
+            else 
+            {
+                $DataFileUpload = $False
+                Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") + " - Dest3 Data file upload failure"
+            }
+
+            # Remove local copy of Dest3 data file
+
+            Remove-Item -Path "D:\FF\Dest3\Application_Dest3_$Filenamedate.txt"
+
+            # Clean up output files and log files - move to \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\
+
+            Get-ChildItem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" -Depth 0 -File | Move-Item -Destination "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\"
+
+            # Remove archived files older than 60 days
+
+            $DaysBack = "-60"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\" -Depth 0 -File | Where-Object {$_.LastWriteTime -lt $dateToDelete} | Remove-Item -Verbose
+        }
+
+        "Dest5"
+        {
+            # SFTP Upload to Tumbleweed - User/Password authentication
+
+            $Filenamedate = get-date -Format "yyyyMMdd"
+
+            # Source file paths
+            $SourceFiles = get-childitem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" -File -Depth 0 | Select Name,FullName
+ 
+            # Declare array to contain upload success/failure
+
+            $UploadResult = @()
+
+            Foreach ($item in $SourceFiles)
+            {
+                # Upload Dest5 Files sequentially in loop
+                SFTPUPload -Destination Dest5 -AuthType Password -SFTPUser $SFTPUser -Password $Password -SFTPHostname $SFTPHostname -UploadDirectory $UploadDirectory -Port $Port -File $item.FullName
+                
+                # Confirm upload
+                $DataFileUploadStdOutLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" + $item.Name + "_upload_stdout.log"
+                if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "100%") -ne $Null)
+                {
+                    $DataFileUpload = $True
+                    $UploadResult += "Success"
+                    Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") ($item.Name) "upload success"
+                } 
+                else 
+                {
+                    $DataFileUpload = $False
+                    $UploadResult += "Failure"
+                    Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") ($item.Name) "upload failure"
+                }
+            } 
+            
+            # Clean up output files and log files - move to \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\
+
+            Get-ChildItem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\" -Depth 0 -File | Move-Item -Destination "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\"
+
+            # If succsessfully uploaded to Dest5, write date/time to [Application_KYC_AM_MISDW_UAT][dbo.Dest5_FEED_RUN_DATE]
+            
+            If ($UploadResult -notcontains "Failure")
+            {
+                # Upload success, write date/time to [Application_KYC_AM_MISDW_UAT][dbo.Dest5_FEED_RUN_DATE] using stored procedure dbo.Dest5_FEED_DATE
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") "Dest5 data files uploaded successfully"
+                Write-host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") "Writing date/time of successful upload to [Application_KYC_AM_MISDW_UAT][dbo.Dest5_FEED_RUN_DATE]"
+                
+                $conString = "server=$DBServerFQDN;database=$Database;integrated security=true"
+                $con = new-object System.Data.SqlClient.SqlConnection
+                $con.connectionstring = $conString
+                
+                try
+                {
+                    $con.Open()
+                    $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                    Write-Host "$DateTime Connection to $DBServerFQDN successfully established."
+                    try
+                    {
+                        $cmd = New-Object System.Data.SqlClient.SqlCommand
+                        $cmd.Connection = $con
+                        $cmd.CommandText = "EXEC dbo.Dest5_FEED_DATE"
+                        $cmd.ExecuteNonQuery() | Out-Null
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Host "$DateTime Stored procedure dbo.Dest5_FEED_DATE executed successfully."
+                    }
+
+                    catch [Exception]
+                    {
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Warning $DateTime $_.Exception.Message
+                    }
+                }
+
+                catch [Exception]
+                {
+                    $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                    Write-Warning $DateTime $_.Exception.Message
+                }
+
+                finally
+                {
+                        $con.Dispose()
+                        $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                        Write-Host "$DateTime SQL connection to $DBServerFQDN closed."
+                        $cmd.Dispose()
+                }        
+            }
+
+            else
+            {
+                # Upload failure, investigate - send email?
+                ## Send email with relevant logs from failed transfer?
+                $DateTime = (get-date -Format "[dd-MM-yyyy hh:mm:ss]")
+                Write-host "$DateTime At least one Dest5 datafile upload has failed"
+            }
+            
+            # Remove archived files older than 60 days
+
+            $DaysBack = "-60"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\" -Depth 0 -File | Where-Object {$_.CreationTime -lt $dateToDelete} | Remove-Item -Verbose
+        }
+
+        {$_ -eq "Dest4" -or "Dest4AuM" -or "Dest4AumHistorical"}
+        {
+            # SFTP Upload to Tumbleweed - User/Password authentication
+
+            # $Filenamedate = get-date -Format "yyyyMMdd"
+
+            # Source file paths
+            $SourceFiles = get-childitem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\" -File -Depth 0 | Select Name,FullName
+ 
+            # Declare array to contain upload success/failure
+
+            $UploadResult = @()
+
+            Foreach ($item in $SourceFiles)
+            {
+                # Upload Dest4 Files sequentially in loop
+                SFTPUPload -Destination Dest4 -AuthType Password -SFTPUser $SFTPUser -Password $Password -SFTPHostname $SFTPHostname -UploadDirectory $UploadDirectory -Port $Port -File $item.FullName
+                
+                # Confirm upload
+                $DataFileUploadStdOutLog = "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\" + $item.Name + "_upload_stdout.log"
+                if ((Get-Content -Path $DataFileUploadStdOutLog | Select-String "100%") -ne $Null)
+                {
+                    $DataFileUpload = $True
+                    $UploadResult += "Success"
+                    Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") ($item.Name) "upload success"
+                } 
+                else 
+                {
+                    $DataFileUpload = $False
+                    $UploadResult += "Failure"
+                    Write-Host (get-date -Format "[dd-MM-yyyy hh:mm:ss]") ($item.Name) "upload failure"
+                }
+            } 
+            
+            # Clean up output files and log files - move to \\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\$Destination\FF\UAT\Archive\
+            Get-ChildItem -Path "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\" -Depth 0 -File | Move-Item -Destination "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\Archive\"
+            
+            # Remove archived files older than 180 days
+            $DaysBack = "-180"
+            $Date = Get-date
+            $dateToDelete = $Date.AddDays($DaysBack)
+            Get-ChildItem "\\Companyprod.msad.Company.net\groupshares\GLOBAL\ApplicationDOCSTORE\Dest4\FF\UAT\Archive\" -Depth 0 -File | Where-Object {$_.CreationTime -lt $dateToDelete} | Remove-Item -Verbose
+        }
+
+        <#
+        "Dest4AuM"
+        {
+        
+        }
+        #>
+    }
+}
